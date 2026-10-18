@@ -121,21 +121,29 @@ def answer_question(question):
             return str(len(refunded))
         return f"{refund_total:.2f} USD"
 
-    if any(word in q for word in ["how many", "number of", "count"]):
-        if "customer" in q:
-            return str(len({o.get("customer") for o in filtered}))
-        if "order" in q:
-            return str(len(filtered))
-        if "unit" in q or "quantity" in q or "items" in q:
-            return str(sum(int(o.get("qty", 0)) for o in filtered))
-        return str(len(filtered))
+
+	if any(word in q for word in ["how many", "number of", "count"]):
+    		if "paid" in q:
+        		return str(len(paid))
+    		if "customer" in q:
+        		return str(len({o.get("customer") for o in filtered}))
+    		if "order" in q:
+        		return str(len(filtered))
+   		if "unit" in q or "quantity" in q or "items" in q:
+        		return str(sum(int(o.get("qty", 0)) for o in filtered))
+    		return str(len(filtered))
+
 
     if any(word in q for word in ["average", "avg"]):
         if not paid:
             return "0.00 USD"
         return f"{revenue / len(paid):.2f} USD"
 
-    if any(word in q for word in ["top", "most popular", "best-selling", "best selling"]):
+    if any(word in q for word in [
+    "top", "most popular", "best-selling", "best selling",
+    "highest sales", "highest-selling", "highest selling",
+    "most sales"
+]):
         totals = defaultdict(float)
         for o in paid:
             key = o.get("product", "Unknown")
