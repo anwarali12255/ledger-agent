@@ -2,12 +2,15 @@
 import json
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
+UTC = timezone.utc
 
 with open("all_orders.json", "r", encoding="utf-8-sig") as file:
     raw_orders = json.load(file)
@@ -20,19 +23,45 @@ if "usd_per_unit" in raw_rates:
 else:
     rates = raw_rates
 
-# Keep the latest version of each order.
+
+def parse_datetime(value):
+    if not value:
+        return None
+
+    try:
+        result = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=UTC)
+
+        return result.astimezone(UTC)
+
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+# Keep the most recently updated version of each order.
 latest_orders = {}
 
 for order in raw_orders:
     order_id = order.get("id")
 
+    if order_id is None:
+        continue
+
     if order_id not in latest_orders:
         latest_orders[order_id] = order
-    else:
-        old_date = latest_orders[order_id].get("updated_at", "")
-        new_date = order.get("updated_at", "")
+        continue
 
-        if new_date > old_date:
+    old_time = parse_datetime(
+        latest_orders[order_id].get("updated_at")
+    )
+    new_time = parse_datetime(order.get("updated_at"))
+
+    if new_time is not None:
+        if old_time is None or new_time > old_time:
             latest_orders[order_id] = order
 
 orders = list(latest_orders.values())
@@ -47,37 +76,33 @@ def amount_usd(order):
             * float(order.get("unit_price", 0))
         )
 
-    currency = order.get("currency", "USD")
-    rate = float(rates.get(currency, 1))
+    currency = str(order.get("currency", "USD")).upper()
 
-    return float(amount) * rate
+    if currency not in rates:
+        raise ValueError("Unknown currency: " + currency)
+
+    return float(amount) * float(rates[currency])
 
 
-def order_date(order):
-    value = order.get("created_at", "")
+def business_date(order):
+    date = parse_datetime(order.get("created_at"))
 
-    try:
-        date = datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-        if date.tzinfo is None:
-            date = date.replace(tzinfo=ZoneInfo("UTC"))
-
-        return date.astimezone(ZoneInfo("Asia/Kolkata"))
-
-    except (ValueError, TypeError, AttributeError):
+    if date is None:
         return None
+
+    return date.astimezone(BUSINESS_TZ)
 
 
 def answer_question(question):
     q = question.lower().strip()
     filtered = orders[:]
 
-    # Filter by product name when one is mentioned.
+    # Filter by a named product.
     products = sorted(
         {
-            str(o.get("product", ""))
-            for o in orders
-            if o.get("product")
+            str(order.get("product", ""))
+            for order in orders
+            if order.get("product")
         },
         key=len,
         reverse=True
@@ -86,17 +111,18 @@ def answer_question(question):
     for product in products:
         if product.lower() in q:
             filtered = [
-                o for o in filtered
-                if str(o.get("product", "")).lower() == product.lower()
+                order for order in filtered
+                if str(order.get("product", "")).lower()
+                == product.lower()
             ]
             break
 
     # Filter by region.
     regions = sorted(
         {
-            str(o.get("region", ""))
-            for o in orders
-            if o.get("region")
+            str(order.get("region", ""))
+            for order in orders
+            if order.get("region")
         },
         key=len,
         reverse=True
@@ -105,17 +131,18 @@ def answer_question(question):
     for region in regions:
         if re.search(r"\b" + re.escape(region.lower()) + r"\b", q):
             filtered = [
-                o for o in filtered
-                if str(o.get("region", "")).lower() == region.lower()
+                order for order in filtered
+                if str(order.get("region", "")).lower()
+                == region.lower()
             ]
             break
 
     # Filter by customer.
     customers = sorted(
         {
-            str(o.get("customer", ""))
-            for o in orders
-            if o.get("customer")
+            str(order.get("customer", ""))
+            for order in orders
+            if order.get("customer")
         },
         key=len,
         reverse=True
@@ -124,15 +151,16 @@ def answer_question(question):
     for customer in customers:
         if customer.lower() in q:
             filtered = [
-                o for o in filtered
-                if str(o.get("customer", "")).lower() == customer.lower()
+                order for order in filtered
+                if str(order.get("customer", "")).lower()
+                == customer.lower()
             ]
             break
 
-    # Filter by year and month using Asia/Kolkata dates.
+    # Filter by year and month using business dates.
     year_match = re.search(r"\b(20\d{2})\b", q)
 
-    month_names = {
+    months = {
         "january": 1,
         "february": 2,
         "march": 3,
@@ -149,16 +177,16 @@ def answer_question(question):
 
     month_number = None
 
-    for month_name, number in month_names.items():
+    for month_name, number in months.items():
         if re.search(r"\b" + month_name + r"\b", q):
             month_number = number
             break
 
     if year_match or month_number:
-        date_filtered = []
+        selected = []
 
         for order in filtered:
-            date = order_date(order)
+            date = business_date(order)
 
             if date is None:
                 continue
@@ -169,96 +197,84 @@ def answer_question(question):
             if month_number and date.month != month_number:
                 continue
 
-            date_filtered.append(order)
+            selected.append(order)
 
-        filtered = date_filtered
+        filtered = selected
 
-    # Status groups.
+    # Only paid orders contribute to revenue.
     paid = [
-        o for o in filtered
-        if str(o.get("status", "")).lower() == "paid"
+        order for order in filtered
+        if str(order.get("status", "")).lower() == "paid"
     ]
 
     refunded = [
-        o for o in filtered
-        if str(o.get("status", "")).lower() == "refunded"
+        order for order in filtered
+        if str(order.get("status", "")).lower() == "refunded"
     ]
 
-    revenue = sum(amount_usd(o) for o in paid)
-    refund_total = sum(amount_usd(o) for o in refunded)
+    revenue = sum(amount_usd(order) for order in paid)
+    refund_total = sum(amount_usd(order) for order in refunded)
 
-    # Detect product revenue ranking questions before general sales questions.
-    product_ranking = (
+    # Detect product revenue ranking questions first.
+    ranking_words = [
+        "top", "highest", "most", "best", "earned",
+        "best-selling", "best selling",
+        "top-selling", "top selling",
+        "highest-selling", "highest selling",
+        "most popular"
+    ]
+
+    ranking_question = any(word in q for word in ranking_words)
+
+    product_question = (
         "product" in q
+        or "item" in q
         or "which" in q
-        or "earned the most" in q
-        or "best-selling" in q
-        or "best selling" in q
-        or "highest-selling" in q
-        or "highest selling" in q
-        or "most popular" in q
-        or "top product" in q
     )
 
-    ranking_words = (
-        "highest" in q
-        or "most" in q
-        or "top" in q
-        or "best" in q
-        or "earned" in q
-        or "popular" in q
-    )
+    revenue_question = any(word in q for word in [
+        "revenue", "sales", "selling", "sold",
+        "earned", "amount"
+    ])
 
-    if product_ranking and ranking_words and any(
-        word in q for word in [
-            "revenue", "sales", "earned", "product",
-            "selling", "popular"
-        ]
+    if (
+        ranking_question
+        and product_question
+        and revenue_question
     ):
-        product_totals = defaultdict(float)
+        totals = defaultdict(float)
 
         for order in paid:
             name = order.get("product", "Unknown")
-            product_totals[name] += amount_usd(order)
+            totals[name] += amount_usd(order)
 
-        if not product_totals:
+        if not totals:
             return "No matching paid orders found."
 
-        best_product = max(
-            product_totals,
-            key=product_totals.get
-        )
+        best_product = max(totals, key=totals.get)
 
         return (
             f"{best_product}: "
-            f"{product_totals[best_product]:.2f} USD"
+            f"{totals[best_product]:.2f} USD"
         )
 
     # Highest-spending customer.
     if (
         "customer" in q
         and any(word in q for word in [
-            "highest", "most", "spent", "spend", "top"
+            "highest", "most", "top", "spent", "spend"
         ])
     ):
-        customer_totals = defaultdict(float)
+        totals = defaultdict(float)
 
         for order in paid:
-            name = order.get("customer", "Unknown")
-            customer_totals[name] += amount_usd(order)
+            totals[order.get("customer", "Unknown")] += amount_usd(order)
 
-        if not customer_totals:
+        if not totals:
             return "No matching paid orders found."
 
-        best_customer = max(
-            customer_totals,
-            key=customer_totals.get
-        )
-
-        return (
-            f"{best_customer}: "
-            f"{customer_totals[best_customer]:.2f} USD"
-        )
+        name = max(totals, key=totals.get)
+        return f"{name}: {totals[name]:.2f} USD"
 
     # Highest-revenue region.
     if (
@@ -267,24 +283,21 @@ def answer_question(question):
             "highest", "most", "top", "best"
         ])
     ):
-        region_totals = defaultdict(float)
+        totals = defaultdict(float)
 
         for order in paid:
-            name = order.get("region", "Unknown")
-            region_totals[name] += amount_usd(order)
+            totals[order.get("region", "Unknown")] += amount_usd(order)
 
-        if not region_totals:
+        if not totals:
             return "No matching paid orders found."
 
-        best_region = max(region_totals, key=region_totals.get)
-
-        return (
-            f"{best_region}: "
-            f"{region_totals[best_region]:.2f} USD"
-        )
+        name = max(totals, key=totals.get)
+        return f"{name}: {totals[name]:.2f} USD"
 
     # Refund questions.
-    if any(word in q for word in ["refund", "refunded", "refunds"]):
+    if any(word in q for word in [
+        "refund", "refunded", "refunds"
+    ]):
         if any(word in q for word in [
             "how many", "number of", "count"
         ]):
@@ -301,24 +314,24 @@ def answer_question(question):
 
         if "customer" in q:
             return str(len({
-                o.get("customer")
-                for o in filtered
-                if o.get("customer")
+                order.get("customer")
+                for order in filtered
+                if order.get("customer")
             }))
 
         if "product" in q:
             return str(len({
-                o.get("product")
-                for o in filtered
-                if o.get("product")
+                order.get("product")
+                for order in filtered
+                if order.get("product")
             }))
 
         if any(word in q for word in [
             "unit", "quantity", "items"
         ]):
             return str(sum(
-                int(o.get("qty", 0))
-                for o in filtered
+                int(order.get("qty", 0))
+                for order in filtered
             ))
 
         if "order" in q:
@@ -326,20 +339,20 @@ def answer_question(question):
 
         return str(len(filtered))
 
-    # Average order revenue.
+    # Average revenue per paid order.
     if "average" in q or "avg" in q:
         if not paid:
             return "0.00 USD"
 
         return f"{revenue / len(paid):.2f} USD"
 
-    # General revenue and sales questions.
+    # Total revenue questions.
     if any(word in q for word in [
         "revenue", "sales", "sold", "amount", "total", "money"
     ]):
         return f"{revenue:.2f} USD"
 
-    # General order summary.
+    # General summary.
     if not filtered:
         return "No matching orders found."
 
@@ -369,12 +382,11 @@ def home():
         }), 400
 
     try:
-        answer = answer_question(question)
-        return jsonify({"answer": answer})
-
+        return jsonify({
+            "answer": answer_question(question)
+        })
     except Exception:
-        app.logger.exception("Failed to answer question")
-
+        app.logger.exception("Error answering question")
         return jsonify({
             "answer": "Unable to process this question."
         }), 500
