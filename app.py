@@ -343,11 +343,11 @@ def answer_question(question):
 
         return f"{revenue / len(paid):.2f} USD"
 
-    # Total revenue questions.
+        # Total revenue questions.
     if any(word in q for word in [
         "revenue", "sales", "sold", "amount", "total", "money"
     ]):
-        return f"{revenue:.2f} USD"
+        return f"{revenue:.2f}"
 
     # General summary.
     if not filtered:
