@@ -1,65 +1,82 @@
 
 import json
-import os
 import re
+from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from collections import defaultdict
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+with open("all_orders.json", "r", encoding="utf-8-sig") as file:
+    raw_orders = json.load(file)
 
-with open(os.path.join(BASE_DIR, "all_orders.json"), encoding="utf-8-sig") as f:
-    raw_orders = json.load(f)
+with open("rates.json", "r", encoding="utf-8-sig") as file:
+    raw_rates = json.load(file)
 
-with open(os.path.join(BASE_DIR, "rates.json"), encoding="utf-8-sig") as f:
-    rates_data = json.load(f)
-
-# Support both the API's original rate format and the saved rates.json format.
-if "usd_per_unit" in rates_data:
-    RATES = rates_data["usd_per_unit"]
+if isinstance(raw_rates, dict) and "usd_per_unit" in raw_rates:
+    rates = raw_rates["usd_per_unit"]
 else:
-    RATES = rates_data
+    rates = raw_rates
 
-# Keep the latest version of each order ID.
+# Keep the latest version of each order.
 latest_orders = {}
 
-def parse_date(value):
-    if not value:
-        return datetime.min.replace(tzinfo=ZoneInfo("UTC"))
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
 for order in raw_orders:
-    order_id = order["id"]
-    if (
-        order_id not in latest_orders
-        or parse_date(order.get("updated_at")) >
-        parse_date(latest_orders[order_id].get("updated_at"))
-    ):
+    order_id = order.get("id")
+
+    if order_id not in latest_orders:
         latest_orders[order_id] = order
+    else:
+        old_date = latest_orders[order_id].get("updated_at", "")
+        new_date = order.get("updated_at", "")
+
+        if new_date > old_date:
+            latest_orders[order_id] = order
 
 orders = list(latest_orders.values())
 
-def amount_usd(order):
-    currency = order.get("currency", "USD")
-    amount = float(order.get("amount", 0))
-    return amount * float(RATES.get(currency, 0))
 
-def business_date(order):
-    dt = parse_date(order.get("created_at"))
-    return dt.astimezone(ZoneInfo("Asia/Kolkata"))
+def amount_usd(order):
+    amount = order.get("amount")
+
+    if amount is None:
+        amount = float(order.get("qty", 0)) * float(
+            order.get("unit_price", 0)
+        )
+
+    currency = order.get("currency", "USD")
+    rate = float(rates.get(currency, 1))
+
+    return float(amount) * rate
+
+
+def order_date(order):
+    value = order.get("created_at", "")
+
+    try:
+        date = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=ZoneInfo("UTC"))
+
+        return date.astimezone(
+            ZoneInfo("Asia/Kolkata")
+        )
+    except (ValueError, TypeError):
+        return None
+
 
 def answer_question(question):
     q = question.lower()
     filtered = orders[:]
 
-    # Filter by product, region, or customer when named in the question.
+    # Filter by product.
     products = sorted(
-        {str(o.get("product", "")) for o in orders},
-        key=len, reverse=True
+        {str(o.get("product", "")) for o in orders if o.get("product")}
     )
+
     for product in products:
         if product.lower() in q:
             filtered = [
@@ -68,10 +85,11 @@ def answer_question(question):
             ]
             break
 
+    # Filter by region.
     regions = sorted(
-        {str(o.get("region", "")) for o in orders},
-        key=len, reverse=True
+        {str(o.get("region", "")) for o in orders if o.get("region")}
     )
+
     for region in regions:
         if re.search(r"\b" + re.escape(region.lower()) + r"\b", q):
             filtered = [
@@ -80,7 +98,13 @@ def answer_question(question):
             ]
             break
 
-    customers = {str(o.get("customer", "")) for o in orders}
+    # Filter by customer.
+    customers = sorted(
+        {str(o.get("customer", "")) for o in orders if o.get("customer")},
+        key=len,
+        reverse=True
+    )
+
     for customer in customers:
         if customer.lower() in q:
             filtered = [
@@ -89,7 +113,7 @@ def answer_question(question):
             ]
             break
 
-    # Optional year and month filters.
+    # Filter by year and month.
     year_match = re.search(r"\b(20\d{2})\b", q)
     month_names = {
         "january": 1, "february": 2, "march": 3,
@@ -97,104 +121,186 @@ def answer_question(question):
         "july": 7, "august": 8, "september": 9,
         "october": 10, "november": 11, "december": 12
     }
-    selected_month = next(
-        (number for name, number in month_names.items() if name in q),
-        None
-    )
 
-    if year_match or selected_month:
-        filtered = [
-            o for o in filtered
-            if (not year_match or business_date(o).year == int(year_match.group(1)))
-            and (not selected_month or business_date(o).month == selected_month)
-        ]
+    month_number = None
 
-    paid = [o for o in filtered if o.get("status", "").lower() == "paid"]
-    refunded = [
-        o for o in filtered if o.get("status", "").lower() == "refunded"
+    for month_name, number in month_names.items():
+        if month_name in q:
+            month_number = number
+            break
+
+    if year_match or month_number:
+        selected = []
+
+        for order in filtered:
+            date = order_date(order)
+
+            if date is None:
+                continue
+
+            if year_match and date.year != int(year_match.group(1)):
+                continue
+
+            if month_number and date.month != month_number:
+                continue
+
+            selected.append(order)
+
+        filtered = selected
+
+    paid = [
+        o for o in filtered
+        if str(o.get("status", "")).lower() == "paid"
     ]
+
+    refunded = [
+        o for o in filtered
+        if str(o.get("status", "")).lower() == "refunded"
+    ]
+
     revenue = sum(amount_usd(o) for o in paid)
     refund_total = sum(amount_usd(o) for o in refunded)
 
+    # Product sales ranking.
+    if any(word in q for word in [
+        "highest sales", "most sales", "top product",
+        "best-selling", "best selling", "most popular",
+        "highest-selling", "highest selling"
+    ]):
+        totals = defaultdict(float)
+
+        for order in paid:
+            totals[order.get("product", "Unknown")] += amount_usd(order)
+
+        if not totals:
+            return "No matching paid orders found."
+
+        name = max(totals, key=totals.get)
+        return f"{name}: {totals[name]:.2f} USD"
+
+    # Refund questions.
     if any(word in q for word in ["refund", "refunded", "refunds"]):
-        if "how many" in q or "number of" in q or "count" in q:
+        if any(word in q for word in [
+            "how many", "number of", "count"
+        ]):
             return str(len(refunded))
+
         return f"{refund_total:.2f} USD"
 
+    # Count questions.
+    if any(word in q for word in [
+        "how many", "number of", "count"
+    ]):
+        if "paid" in q:
+            return str(len(paid))
 
-	if any(word in q for word in ["how many", "number of", "count"]):
-    		if "paid" in q:
-        		return str(len(paid))
-    		if "customer" in q:
-        		return str(len({o.get("customer") for o in filtered}))
-    		if "order" in q:
-        		return str(len(filtered))
-   		if "unit" in q or "quantity" in q or "items" in q:
-        		return str(sum(int(o.get("qty", 0)) for o in filtered))
-    		return str(len(filtered))
+        if "refunded" in q:
+            return str(len(refunded))
 
+        if "customer" in q:
+            return str(len({
+                o.get("customer") for o in filtered
+                if o.get("customer")
+            }))
 
-    if any(word in q for word in ["average", "avg"]):
+        if "product" in q:
+            return str(len({
+                o.get("product") for o in filtered
+                if o.get("product")
+            }))
+
+        if any(word in q for word in [
+            "unit", "quantity", "items"
+        ]):
+            return str(sum(int(o.get("qty", 0)) for o in filtered))
+
+        if "order" in q:
+            return str(len(filtered))
+
+        return str(len(filtered))
+
+    # Average questions.
+    if "average" in q or "avg" in q:
         if not paid:
             return "0.00 USD"
+
+        if "order" in q:
+            return f"{revenue / len(paid):.2f} USD"
+
         return f"{revenue / len(paid):.2f} USD"
 
+    # Highest-spending customer.
+    if "customer" in q and any(word in q for word in [
+        "spend", "spent", "purchase", "bought", "highest"
+    ]):
+        totals = defaultdict(float)
+
+        for order in paid:
+            totals[order.get("customer", "Unknown")] += amount_usd(order)
+
+        if not totals:
+            return "No matching paid orders found."
+
+        name = max(totals, key=totals.get)
+        return f"{name}: {totals[name]:.2f} USD"
+
+    # Highest-revenue region.
+    if "region" in q and any(word in q for word in [
+        "highest", "most", "top", "best"
+    ]):
+        totals = defaultdict(float)
+
+        for order in paid:
+            totals[order.get("region", "Unknown")] += amount_usd(order)
+
+        if not totals:
+            return "No matching paid orders found."
+
+        name = max(totals, key=totals.get)
+        return f"{name}: {totals[name]:.2f} USD"
+
+    # Revenue and sales questions.
     if any(word in q for word in [
-    "top", "most popular", "best-selling", "best selling",
-    "highest sales", "highest-selling", "highest selling",
-    "most sales"
-]):
-        totals = defaultdict(float)
-        for o in paid:
-            key = o.get("product", "Unknown")
-            totals[key] += amount_usd(o)
-        if not totals:
-            return "No matching paid orders found."
-        name = max(totals, key=totals.get)
-        return f"{name}: {totals[name]:.2f} USD"
-
-    if "customer" in q and any(w in q for w in ["spend", "spent", "purchase", "bought"]):
-        totals = defaultdict(float)
-        for o in paid:
-            totals[o.get("customer", "Unknown")] += amount_usd(o)
-        if not totals:
-            return "No matching paid orders found."
-        name = max(totals, key=totals.get)
-        return f"{name}: {totals[name]:.2f} USD"
-
-    if any(word in q for word in ["revenue", "sales", "sold", "amount", "total", "money"]):
+        "revenue", "sales", "sold", "amount", "total", "money"
+    ]):
         return f"{revenue:.2f} USD"
 
-    if "product" in q and not filtered:
+    # General summary.
+    if not filtered:
         return "No matching orders found."
 
     return (
-        f"Orders: {len(filtered)}; paid orders: {len(paid)}; "
+        f"Orders: {len(filtered)}; "
+        f"paid orders: {len(paid)}; "
         f"revenue: {revenue:.2f} USD; "
         f"refunded orders: {len(refunded)}; "
         f"refund total: {refund_total:.2f} USD"
     )
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "message": "Acme Appliances Ledger Agent is running",
-        "orders_loaded": len(orders)
-    })
 
-@app.route("/", methods=["POST"])
-def ask():
+@app.route("/", methods=["GET", "POST"])
+def home():
+    if request.method == "GET":
+        return jsonify({
+            "message": "Ledger Agent is running",
+            "orders_loaded": len(orders)
+        })
+
     data = request.get_json(silent=True) or {}
-    question = data.get("question")
+    question = data.get("question", "")
 
     if not isinstance(question, str) or not question.strip():
-        return jsonify({"error": "Please provide a question."}), 400
+        return jsonify({"answer": "Please provide a question."}), 400
 
     try:
-        return jsonify({"answer": answer_question(question)})
+        answer = answer_question(question)
+        return jsonify({"answer": answer})
     except Exception:
-        app.logger.exception("Could not answer question")
-        return jsonify({"answer": "Unable to answer this question."}), 500
+        app.logger.exception("Failed to answer question")
+        return jsonify({
+            "answer": "Unable to process this question."
+        }), 500
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(debug=True)
