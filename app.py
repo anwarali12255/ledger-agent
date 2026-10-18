@@ -271,13 +271,21 @@ def answer_question(question):
 
     # Refund questions.
     if any(word in q for word in ["refund", "refunded", "refunds"]):
-        if any(word in q for word in ["how many", "number of", "count"]):
+        if (
+    any(word in q for word in ["how many", "number of", "count"])
+    and "average" not in q
+    and "avg" not in q
+):
             return str(len(refunded))
 
         return f"{refund_total:.2f} USD"
 
     # Count questions.
-    if any(word in q for word in ["how many", "number of", "count"]):
+    if (
+    any(word in q for word in ["how many", "number of", "count"])
+    and "average" not in q
+    and "avg" not in q
+):
 
         # IMPORTANT: Count distinct customers before counting paid orders.
         if "customer" in q:
