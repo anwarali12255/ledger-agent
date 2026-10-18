@@ -253,10 +253,7 @@ def answer_question(question):
 
         best_product = max(totals, key=totals.get)
 
-        return (
-            f"{best_product}: "
-            f"{totals[best_product]:.2f} USD"
-        )
+        return best_product
 
     # Highest-spending customer.
     if (
